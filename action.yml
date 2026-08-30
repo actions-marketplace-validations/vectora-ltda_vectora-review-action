@@ -1,0 +1,91 @@
+name: Vectora Bot — PR Review
+description: >-
+  Automatic pull request review powered by Vectora Bot. Requires a
+  Vectora Pro account — configure your provider and generate a token at
+  https://bot.vectora.company.
+author: Vectora
+branding:
+  icon: message-square
+  color: blue
+
+inputs:
+  token:
+    description: >-
+      VECTORA_BOT_TOKEN generated at https://bot.vectora.company. Pass it
+      via a GitHub Environment secret, not a plain repository secret.
+    required: true
+  github-token:
+    description: Token used to post the review comment (usually secrets.GITHUB_TOKEN).
+    required: true
+  panel-url:
+    description: Base URL of the Vectora Bot panel/API.
+    required: false
+    default: https://bot.vectora.company
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch bot configuration
+      id: config
+      shell: bash
+      run: |
+        set -euo pipefail
+        res=$(curl -sS -w '\n%{http_code}' \
+          -H "Authorization: Bearer ${{ inputs.token }}" \
+          "${{ inputs.panel-url }}/gha-bot/config")
+        body=$(echo "$res" | head -n -1)
+        status=$(echo "$res" | tail -n1)
+        if [ "$status" != "200" ]; then
+          echo "::error::Failed to fetch Vectora Bot config (HTTP $status): $body"
+          exit 1
+        fi
+        echo "provider=$(echo "$body" | jq -r .provider)" >> "$GITHUB_OUTPUT"
+        echo "model=$(echo "$body" | jq -r .model)" >> "$GITHUB_OUTPUT"
+        echo "review_style=$(echo "$body" | jq -r .review_style)" >> "$GITHUB_OUTPUT"
+        # A chave nunca vai pro log/output do job — só pro env deste
+        # processo, via GITHUB_ENV (mascarado, não aparece em `set -x`/echo).
+        api_key=$(echo "$body" | jq -r .api_key)
+        echo "::add-mask::$api_key"
+        echo "VECTORA_PROVIDER_API_KEY=$api_key" >> "$GITHUB_ENV"
+
+    - name: Download vectora-cli
+      shell: bash
+      run: |
+        set -euo pipefail
+        curl -sSL -o vectora-cli.tar.gz "${{ inputs.panel-url }}/gha-bot/download/latest"
+        mkdir -p "$RUNNER_TEMP/vectora-cli"
+        tar -xzf vectora-cli.tar.gz -C "$RUNNER_TEMP/vectora-cli"
+        echo "$RUNNER_TEMP/vectora-cli" >> "$GITHUB_PATH"
+
+    - name: Set provider API key env var
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "${{ steps.config.outputs.provider }}" in
+          anthropic) var=ANTHROPIC_API_KEY ;;
+          openai) var=OPENAI_API_KEY ;;
+          google_genai) var=GOOGLE_API_KEY ;;
+          openrouter) var=OPENROUTER_API_KEY ;;
+          *) var="" ;;
+        esac
+        if [ -n "$var" ]; then
+          echo "$var=$VECTORA_PROVIDER_API_KEY" >> "$GITHUB_ENV"
+        fi
+
+    - name: Review pull request
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REVIEW_STYLE: ${{ steps.config.outputs.review_style }}
+        MODEL_ID: "${{ steps.config.outputs.provider }}:${{ steps.config.outputs.model }}"
+      run: |
+        set -euo pipefail
+        diff=$(gh pr diff "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}")
+        task="Review this pull request (style: ${REVIEW_STYLE}). Focus on correctness, security and design issues — be concise and specific, cite file/line when possible. Diff:
+
+        ${diff}"
+        review=$(vectora-cli run --task "$task" --model "$MODEL_ID")
+        echo "$review" > "$RUNNER_TEMP/vectora-review.md"
+        gh pr comment "${{ github.event.pull_request.number }}" \
+          --repo "${{ github.repository }}" \
+          --body-file "$RUNNER_TEMP/vectora-review.md"
