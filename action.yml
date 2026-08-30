@@ -1,8 +1,5 @@
 name: Vectora Bot — PR Review
-description: >-
-  Automatic pull request review powered by Vectora Bot. Requires a
-  Vectora Pro account — configure your provider and generate a token at
-  https://bot.vectora.company.
+description: Automatic PR review powered by Vectora Bot — requires a Vectora Pro account.
 author: Vectora
 branding:
   icon: message-square
