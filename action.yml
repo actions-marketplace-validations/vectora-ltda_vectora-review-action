@@ -18,12 +18,39 @@ inputs:
     description: Base URL of the Vectora Bot panel/API.
     required: false
     default: https://bot.vectora.company
+  skip-draft:
+    description: Skip review while the pull request is a draft.
+    required: false
+    default: "true"
+  skip-marker:
+    description: Skip review when the PR title contains this text.
+    required: false
+    default: "[skip vectora]"
 
 runs:
   using: composite
   steps:
+    - name: Check whether this PR should be reviewed
+      id: gate
+      shell: bash
+      run: |
+        set -euo pipefail
+        skip=false
+        if [ "${{ inputs.skip-draft }}" = "true" ] && [ "${{ github.event.pull_request.draft }}" = "true" ]; then
+          echo "::notice::Skipping review — PR is a draft."
+          skip=true
+        fi
+        title="${{ github.event.pull_request.title }}"
+        marker="${{ inputs.skip-marker }}"
+        if [ -n "$marker" ] && [[ "$title" == *"$marker"* ]]; then
+          echo "::notice::Skipping review — title contains \"$marker\"."
+          skip=true
+        fi
+        echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
     - name: Fetch bot configuration
       id: config
+      if: steps.gate.outputs.skip != 'true'
       shell: bash
       run: |
         set -euo pipefail
@@ -46,6 +73,7 @@ runs:
         echo "VECTORA_PROVIDER_API_KEY=$api_key" >> "$GITHUB_ENV"
 
     - name: Download vectora-cli
+      if: steps.gate.outputs.skip != 'true'
       shell: bash
       run: |
         set -euo pipefail
@@ -55,6 +83,7 @@ runs:
         echo "$RUNNER_TEMP/vectora-cli" >> "$GITHUB_PATH"
 
     - name: Set provider API key env var
+      if: steps.gate.outputs.skip != 'true'
       shell: bash
       run: |
         set -euo pipefail
@@ -70,6 +99,7 @@ runs:
         fi
 
     - name: Review pull request
+      if: steps.gate.outputs.skip != 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
@@ -82,7 +112,18 @@ runs:
 
         ${diff}"
         review=$(vectora-cli run --task "$task" --model "$MODEL_ID")
-        echo "$review" > "$RUNNER_TEMP/vectora-review.md"
-        gh pr comment "${{ github.event.pull_request.number }}" \
-          --repo "${{ github.repository }}" \
-          --body-file "$RUNNER_TEMP/vectora-review.md"
+        marker="<!-- vectora-bot-review -->"
+        printf '%s\n%s\n' "$marker" "$review" > "$RUNNER_TEMP/vectora-review.md"
+
+        # Edita o comentário anterior do bot em vez de empilhar um novo a
+        # cada push — procura pelo marker HTML invisível no corpo.
+        existing_id=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+          --jq "[.[] | select(.body | startswith(\"$marker\"))][-1].id // empty")
+        if [ -n "$existing_id" ]; then
+          gh api "repos/${{ github.repository }}/issues/comments/$existing_id" \
+            -X PATCH -f body=@"$RUNNER_TEMP/vectora-review.md"
+        else
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --body-file "$RUNNER_TEMP/vectora-review.md"
+        fi
